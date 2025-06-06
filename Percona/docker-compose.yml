@@ -1,0 +1,121 @@
+services:
+  percona-mysql:
+    image: percona:ps-8.0.42-33
+    environment:
+      - MYSQL_ROOT_PASSWORD=aparavi
+    volumes:
+      - ./mysql-data:/var/lib/mysql
+    command: mysqld --innodb_print_all_deadlocks=1 --innodb_buffer_pool_instances=16 --innodb_buffer_pool_size=4GB --disable-log-bin
+    ports:
+      - 3306
+    healthcheck:
+      test: ["CMD-SHELL", "exit | mysql -h localhost -P 3306 -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  percona-pmm-server:
+    image: percona/pmm-server:latest
+    container_name: percona-pmm
+    restart: always
+    ports:
+      - "8080:8080"     # PMM web interface
+      - "8443:8443"
+    volumes:
+      - ./pmm-data:/srv
+
+  percona-pmm-client:
+    image: percona/pmm-client:latest
+    container_name: pmm-client
+    restart: always
+    depends_on:
+      - percona-pmm-server
+      - percona-mysql
+    environment:
+      PMM_AGENT_SERVER_ADDRESS: percona-pmm:8443
+      PMM_AGENT_SERVER_INSECURE_TLS: "1"
+      PMM_AGENT_SERVER_USERNAME: admin
+      PMM_AGENT_SERVER_PASSWORD: admin
+      PMM_AGENT_SETUP: "1"
+      PMM_AGENT_SETUP_NODE_NAME: percona-mysql-node
+      PMM_AGENT_SETUP_NODE_TYPE: generic
+      PMM_AGENT_SETUP_METRICS_MODE: push
+    user: "0:0"
+    entrypoint: >
+      /bin/bash -c "
+        set -ex
+        # Check if setup is already done
+        if [ -f /usr/local/percona/setup_done ]; then
+          # Just run the agent normally
+          exec pmm-agent --config-file=/usr/local/percona/pmm-agent.yaml
+        else
+          # First time setup
+          sleep 20
+          chmod -R 777 /usr/local/percona
+          pmm-agent setup --force --config-file=/usr/local/percona/pmm-agent.yaml
+          
+          # Start agent in background for admin commands
+          pmm-agent --config-file=/usr/local/percona/pmm-agent.yaml &
+          
+          # Wait for agent to initialize
+          sleep 10
+          
+          # Run admin commands
+          pmm-admin config --server-url=https://admin:admin@percona-pmm:8443 --server-insecure-tls
+          pmm-admin add mysql --username=root --password=root --host=percona-mysql --port=3306 --service-name=mysql-percona --skip-connection-check --query-source=perfschema
+          
+          # Mark setup as done
+          touch /usr/local/percona/setup_done
+          
+          # Exit and let Docker restart us
+          exit 0
+        fi
+      "
+  platform:
+    image: aparavi/aparavi:2.22.0-27472
+    ports:
+      - 9452
+    environment:
+      - APARAVI_PLATFORM=portal.aparavi.com
+      - APARAVI_DBHOST=percona-mysql
+      - APARAVI_DBPORT=3306
+      - APARAVI_DBUSER=root
+      - APARAVI_DBPASS=aparavi
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=12288
+    volumes:
+      - ./platform-config:/etc/opt/aparavi-data-suite
+    healthcheck:
+      test: ["CMD", "curl", "--fail","--head", "http://localhost:9452/server/api"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      percona-mysql:
+        condition: service_healthy
+
+  appagent:
+    image: aparavi/aparavi:2.22.0-27472
+    environment:
+      - APPTYPE=appagt
+      - APARAVI_PLATFORM=platform
+      - APARAVI_PARENT=CLIENTS
+      - APARAVI_DBHOST=percona-mysql
+      - APARAVI_DBPORT=3306
+      - APARAVI_DBUSER=root
+      - APARAVI_DBPASS=aparavi
+      - APARAVI_ANALYTICS=true
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=12288
+    volumes:
+      - ./aggregator-data:/etc/opt/aparavi-data-suite
+      - ./files:/files
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9752/server/api"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      platform:
+        condition: service_healthy
+      percona-mysql:
+        condition: service_healthy
